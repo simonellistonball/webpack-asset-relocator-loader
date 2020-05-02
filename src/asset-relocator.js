@@ -369,6 +369,9 @@ module.exports = async function (content, map) {
             readlink(file, (err, path) => err ? reject(err) : resolve(path));
           });
           const baseDir = path.dirname(file);
+          if (!assetState.assetSymlinks) {
+            assetState.assetSymlinks = {}
+          }
           assetState.assetSymlinks[assetBase(options) + name + file.substr(assetDirPath.length)] = path.relative(baseDir, path.resolve(baseDir, symlink));
         }
         else {
