@@ -35,6 +35,7 @@ module.exports = async function (pkgPath, assetState, assetBase, emitFile, debug
       });
       const baseDir = path.dirname(file);
       assetState.assetSymlinks[file.substr(pkgPath.length + 1)] = path.relative(baseDir, path.resolve(baseDir, symlink));
+      emitFile(assetBase + file.substr(pkgPath.length), source);
     }
     else {
       assetState.assetPermissions[file.substr(pkgPath.length)] = stats.mode;
