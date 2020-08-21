@@ -1,7 +1,7 @@
 # Asset Relocator Loader for Webpack
 
-[![Build Status](https://circleci.com/gh/zeit/webpack-asset-relocator-loader.svg?&style=shield)](https://circleci.com/gh/zeit/workflows/webpack-asset-relocator-loader)
-[![codecov](https://codecov.io/gh/zeit/webpack-asset-relocator-loader/branch/master/graph/badge.svg)](https://codecov.io/gh/zeit/webpack-asset-relocator-loader)
+[![Build Status](https://circleci.com/gh/vercel/webpack-asset-relocator-loader.svg?&style=shield)](https://circleci.com/gh/vercel/workflows/webpack-asset-relocator-loader)
+[![codecov](https://codecov.io/gh/vercel/webpack-asset-relocator-loader/branch/master/graph/badge.svg)](https://codecov.io/gh/vercel/webpack-asset-relocator-loader)
 
 Asset relocation loader used in ncc for performing Node.js builds while emitting and relocating any asset references.
 
@@ -36,9 +36,17 @@ Any `.node` files included will also support binary relocation.
           options: {
             // optional, base folder for asset emission (eg assets/name.ext)
             outputAssetBase: 'assets',
+            // optional, restrict asset emissions to only the given folder.
+            filterAssetBase: process.cwd(),
+            // optional, permit entire __dirname emission
+            // eg `const nonAnalyzable = __dirname` can emit everything in the folder
+            emitDirnameAll: false,
+            // optional, permit entire filterAssetBase emission
+            // eg `const nonAnalyzable = process.cwd()` can emit everything in the cwd()
+            emitFilterAssetBaseAll: false,
             // optional, a list of asset names already emitted or
             // defined that should not be emitted
-            existingAssetNames: []
+            existingAssetNames: [],
             wrapperCompatibility: false, // optional, default
             // build for process.env.NODE_ENV = 'production'
             production: true, // optional, default is undefined
@@ -53,6 +61,47 @@ Any `.node` files included will also support binary relocation.
 ```
 
 Assets will be emitted using `emitAsset`, with their references updated in the code by the loader to the new output location.
+
+### Asset Permissions and Symlinks
+
+Asset symlinks and permissions are maintained in the loader, but aren't passed to Webpack as `emit` doesn't support these.
+
+This information can be obtained from the loader through the API calls `getAssetPermissions()` and `getSymlinks()`:
+
+```js
+const relocateLoader = require('webpack-asset-relocator-loader');
+
+webpack({...}).run((err, stats) => {
+  const assetPermissions = relocateLoader.getAssetPermissions();
+  const symlinks = relocateLoader.getSymlinks();
+});
+```
+
+They will always contain the most recent build state.
+
+### Caching
+
+When using Webpack 5 caching, asset permissions need to be maintained through their own cache, and the public path needs to be injected into the build.
+
+To ensure these cases work out, make sure to run `initAssetCache` in the build, with the `options.outputAssetBase` argument:
+
+```js
+const relocateLoader = require('webpack-asset-relocator-loader');
+
+webpack({
+  // ...
+
+  plugins: [
+    {
+      apply(compiler) {
+        compiler.hooks.compilation.tap("webpack-asset-relocator-loader", compilation => {
+          relocateLoader.initAssetCache(compilation, outputAssetBase);
+        });
+      }
+    }
+  ]
+});
+```
 
 ## How it Works
 
@@ -85,6 +134,5 @@ These include:
 
 * `require.main === module` checks are retained for the entry point being built.
 * `options.wrapperCompatibility`: Automatically handles common AMD / Browserify wrappers to ensure they are properly built by Webpack. See the `utils/wrappers.js` file for the exact transformations currently provided.
-* `options.escapeNonAnalyzableRequires`: Determines when a `require` statement is definitely not analyzable by Webpack, and replaces it with the outer `__non_webpack_require__`. This is useful for things like plugin systems that take a `pluginModule` string and then try to require it, but still won't correcly support contextual requires for local modules.
 * `require.resolve` support in the target environment, while also supporting emission in the build environment.
 * Dynamic `require` statements are analyzed to exact paths wherever possible, and when not possible to analyze, turned into dynamic requires in the target environment.

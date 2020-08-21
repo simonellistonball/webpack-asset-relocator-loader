@@ -15,10 +15,17 @@ const { pregyp, nbind } = require('./utils/binary-locators');
 const handleSpecialCases = require('./utils/special-cases');
 const { getOptions } = require("loader-utils");
 const resolve = require('resolve');
-const stage3 = require('acorn-stage3');
 const mergeSourceMaps = require('./utils/merge-source-maps');
-acorn = acorn.Parser.extend(stage3);
 const os = require('os');
+const nodeGypBuild = require('node-gyp-build');
+
+acorn = acorn.Parser.extend(
+  require("acorn-class-fields"),
+  require("acorn-export-ns-from"),
+  require("acorn-import-meta"),
+  require("acorn-numeric-separator"),
+  require("acorn-static-class-features"),
+);
 
 const extensions = ['.js', '.json', '.node'];
 const { UNKNOWN, FUNCTION, WILDCARD, wildcardRegEx } = evaluate;
@@ -56,6 +63,14 @@ function isIdentifierRead(node, parent) {
   }
 }
 
+function isVarLoop (node) {
+  return node.type === 'ForStatement' || node.type === 'ForInStatement' || node.type === 'ForOfStatement';
+}
+
+function isLoop (node) {
+  return node.type === 'ForStatement' || node.type === 'ForInStatement' || node.type === 'ForOfStatement' || node.type === 'WhileStatement' || node.type === 'DoWhileStatement';
+}
+
 const stateMap = new Map();
 let lastState;
 
@@ -63,7 +78,7 @@ function getAssetState (options, compilation) {
   let state = stateMap.get(compilation);
   if (!state) {
     stateMap.set(compilation, state = {
-      entryId: getEntryId(compilation),
+      entryIds: getEntryIds(compilation),
       assets: Object.create(null),
       assetNames: Object.create(null),
       assetPermissions: Object.create(null),
@@ -81,46 +96,46 @@ function getAssetState (options, compilation) {
   return lastState = state;
 }
 
-function getEntryId (compilation) {
-  if (compilation.options && typeof compilation.options.entry === 'string') {
-    return resolve.sync(compilation.options.entry, { extensions });
-  }
-  if (compilation.entries && compilation.entries.length) {
-    try {
-      return resolve.sync(compilation.entries[0].name || compilation.entries[0].resource, { basedir: path.dirname(compilation.entries[0].context), extensions });
-    }
-    catch (e) {
-      return;
-    }
-  }
-  const entryMap = compilation.entryDependencies;
-  if (entryMap)
-    for (entry of entryMap.values()) {
-      if (entry.length) {
-        try {
-          return resolve.sync(entry[0].request, { basedir: path.dirname(entry[0].context), extensions });
-        }
-        catch (e) {
-          return;
-        }
+const flattenArray = arr => Array.prototype.concat.apply([], arr);
+function getEntryIds (compilation) {
+  if (compilation.options.entry) {
+    if (typeof compilation.options.entry === 'string') {
+      try {
+        return [resolve.sync(compilation.options.entry, { extensions })];
+      }
+      catch (e) {
+        return;
       }
     }
+    else if (typeof compilation.options.entry === 'object') {
+      try {
+        return flattenArray(Object.values(compilation.options.entry)
+          .map(entry => {
+            if (typeof entry === "string") {
+              return [entry];
+            }
+
+            if (entry && Array.isArray(entry.import)) {
+              return entry.import;
+            }
+            
+            return [];
+          })
+        ).map(entryString => resolve.sync(entryString, { extensions }));
+      }
+      catch (e) {
+        return;
+      }
+    }
+  }
 }
 
-function assetBase (options) {
-  const outputAssetBase = options && options.outputAssetBase;
+function assetBase (outputAssetBase) {
   if (!outputAssetBase)
     return '';
   if (outputAssetBase.endsWith('/') || outputAssetBase.endsWith('\\'))
     return outputAssetBase;
   return outputAssetBase + '/';
-}
-
-function relAssetPath (context, options) {
-  const isChunk = context._module.reasons && context._module.reasons.every(reason => reason.module);
-  const filename = isChunk && context._compilation.outputOptions.chunkFilename || context._compilation.outputOptions.filename;
-  const backtrackDepth = filename.split(/[\\/]/).length - 1;
-  return '../'.repeat(backtrackDepth) + assetBase(options);
 }
 
 const staticProcess = {
@@ -141,6 +156,7 @@ const NBIND_INIT = Symbol();
 const FS_FN = Symbol();
 const RESOLVE_FROM = Symbol();
 const BINDINGS = Symbol();
+const NODE_GYP_BUILD = Symbol();
 const fsSymbols = {
   access: FS_FN,
   accessSync: FS_FN,
@@ -189,6 +205,9 @@ const staticModules = Object.assign(Object.create(null), {
   'node-pre-gyp': pregyp,
   'node-pre-gyp/lib/pre-binding': pregyp,
   'node-pre-gyp/lib/pre-binding.js': pregyp,
+  'node-gyp-build': {
+    default: NODE_GYP_BUILD
+  },
   'nbind': {
     init: NBIND_INIT,
     default: {
@@ -239,7 +258,70 @@ function backtrack (self, parent) {
     return self.skip();
 }
 
+const absoluteRegEx = /^\/[^\/]+|^[a-z]:[\\/][^\\/]+/i;
+function isAbsolutePathStr (str) {
+  return typeof str === 'string' && str.match(absoluteRegEx);
+}
+
 const BOUND_REQUIRE = Symbol();
+
+function generateWildcardRequire(dir, wildcardPath, wildcardParam, wildcardBlocks, log) {
+  const wildcardBlockIndex = wildcardBlocks.length;
+  const trailingWildcard = wildcardPath.endsWith(WILDCARD);
+
+  const wildcardIndex = wildcardPath.indexOf(WILDCARD);
+
+  const wildcardPrefix = wildcardPath.substr(0, wildcardIndex);
+  const wildcardSuffix = wildcardPath.substr(wildcardIndex + 1);
+  const endPattern = wildcardSuffix ? '?(.@(js|json|node))' : '.@(js|json|node)';
+
+  // sync to support no emission case
+  if (log)
+    console.log('Generating wildcard requires for ' + wildcardPath.replace(WILDCARD, '*'));
+  let options = glob.sync(wildcardPrefix + '**' + wildcardSuffix + endPattern, { mark: true, ignore: 'node_modules/**/*' });
+
+  if (!options.length)
+    return;
+
+  const optionConditions = options.map((file, index) => {
+    const arg = JSON.stringify(file.substring(wildcardPrefix.length, file.lastIndexOf(wildcardSuffix)));
+    let relPath = path.relative(dir, file).replace(/\\/g, '/');
+    if (!relPath.startsWith('../'))
+      relPath = './' + relPath;
+    let condition = index === 0 ? '  ' : '  else ';
+    if (trailingWildcard && arg.endsWith('.js"'))
+      condition += `if (arg === ${arg} || arg === ${arg.substr(0, arg.length - 4)}")`;
+    else if (trailingWildcard && arg.endsWith('.json"'))
+      condition += `if (arg === ${arg} || arg === ${arg.substr(0, arg.length - 6)}")`;
+    else if (trailingWildcard && arg.endsWith('.node"'))
+      condition += `if (arg === ${arg} || arg === ${arg.substr(0, arg.length - 6)}")`;
+    else
+      condition += `if (arg === ${arg})`;
+    condition += ` return require(${JSON.stringify(relPath)});`;
+    return condition;
+  }).join('\n');
+
+  wildcardBlocks.push(`function __ncc_wildcard$${wildcardBlockIndex} (arg) {\n${optionConditions}\n}`);
+  return `__ncc_wildcard$${wildcardBlockIndex}(${wildcardParam})`;
+}
+
+const hooked = new WeakSet();
+function injectPathHook (compilation, outputAssetBase) {
+  const { mainTemplate } = compilation;
+  if (!hooked.has(mainTemplate)) {
+    hooked.add(mainTemplate);
+
+    mainTemplate.hooks.requireExtensions.tap("asset-relocator-loader", (source, chunk) => {
+      let relBase = '';
+      if (chunk.name) {
+        relBase = path.relative(path.dirname(chunk.name), '.').replace(/\\/g, '/');
+        if (relBase.length)
+          relBase = '/' + relBase;
+      }
+      return `${source}\n__webpack_require__.ab = __dirname + ${JSON.stringify(relBase + '/' + assetBase(outputAssetBase))};`;
+    });
+  }
+}
 
 module.exports = async function (content, map) {
   if (this.cacheable)
@@ -247,11 +329,16 @@ module.exports = async function (content, map) {
   this.async();
   const id = this.resourcePath;
   const dir = path.dirname(id);
+
+  // injection to set __webpack_require__.ab
+  const options = getOptions(this);
+
+  injectPathHook(this._compilation, options.outputAssetBase);
+
   if (id.endsWith('.node')) {
-    const options = getOptions(this);
     const assetState = getAssetState(options, this._compilation);
     const pkgBase = getPackageBase(this.resourcePath) || dir;
-    await sharedlibEmit(pkgBase, assetState, assetBase(options), this.emitFile);
+    await sharedlibEmit(pkgBase, assetState, assetBase(options.outputAssetBase), this.emitFile);
 
     const name = getUniqueAssetName(id.substr(pkgBase.length + 1), id, assetState.assetNames);
     
@@ -259,9 +346,9 @@ module.exports = async function (content, map) {
       stat(id, (err, stats) => err ? reject(err) : resolve(stats.mode))
     );
     assetState.assetPermissions[name] = permissions;
-    this.emitFile(assetBase(options) + name, content);
+    this.emitFile(assetBase(options.outputAssetBase) + name, content);
 
-    this.callback(null, 'module.exports = __non_webpack_require__("./' + relAssetPath(this, options) + JSON.stringify(name).slice(1, -1) + '")');
+    this.callback(null, 'module.exports = __non_webpack_require__(__webpack_require__.ab + ' + JSON.stringify(name) + ')');
     return;
   }
 
@@ -269,8 +356,7 @@ module.exports = async function (content, map) {
     return this.callback(null, code, map);
 
   let code = content.toString();
-
-  const options = getOptions(this);
+  
   if (typeof options.production === 'boolean' && staticProcess.env.NODE_ENV === UNKNOWN) {
     staticProcess.env.NODE_ENV = options.production ? 'production' : 'dev';
   }
@@ -281,7 +367,7 @@ module.exports = async function (content, map) {
       cwd = process.cwd();
   }
   const assetState = getAssetState(options, this._compilation);
-  const entryId = assetState.entryId;
+  const entryIds = assetState.entryIds;
 
   // calculate the base-level package folder to load bindings from
   const pkgBase = getPackageBase(id);
@@ -297,7 +383,7 @@ module.exports = async function (content, map) {
         outName = assetPath.substr(pkgBase.length).replace(/\\/g, '/');
       // If the asset is a ".node" binary, then glob for possible shared
       // libraries that should also be included
-      const nextPromise = sharedlibEmit(pkgBase, assetState, assetBase(options), this.emitFile);
+      const nextPromise = sharedlibEmit(pkgBase, assetState, assetBase(options.outputAssetBase), this.emitFile);
       assetEmissionPromises = assetEmissionPromises.then(() => {
         return nextPromise;
       });
@@ -324,20 +410,24 @@ module.exports = async function (content, map) {
           readlink(assetPath, (err, path) => err ? reject(err) : resolve(path));
         });
         const baseDir = path.dirname(assetPath);
-        assetState.assetSymlinks[assetBase(options) + name] = path.relative(baseDir, path.resolve(baseDir, symlink));
+        assetState.assetSymlinks[assetBase(options.outputAssetBase) + name] = path.relative(baseDir, path.resolve(baseDir, symlink));
       }
       else {
-        assetState.assetPermissions[assetBase(options) + name] = stats.mode;
-        this.emitFile(assetBase(options) + name, source);
+        assetState.assetPermissions[assetBase(options.outputAssetBase) + name] = stats.mode;
+        this.addDependency(assetPath);
+        this.emitFile(assetBase(options.outputAssetBase) + name, source);
       }
     });
     return "(typeof ASSET_RELOCATOR_BASE_DIR === 'undefined' ? __dirname : ASSET_RELOCATOR_BASE_DIR) + '/" + relAssetPath(this, options) + JSON.stringify(name).slice(1, -1) + "'";
   };
   const emitAssetDirectory = (wildcardPath, wildcards) => {
     const wildcardIndex = wildcardPath.indexOf(WILDCARD);
-    const dirIndex = wildcardIndex === -1 ? wildcardPath.length : wildcardPath.lastIndexOf(path.sep, wildcardPath.substr(0, wildcardIndex));
+    const dirIndex = wildcardIndex === -1 ? wildcardPath.length : wildcardPath.lastIndexOf(path.sep, wildcardIndex);
     const assetDirPath = wildcardPath.substr(0, dirIndex);
-    const wildcardPattern = wildcardPath.substr(dirIndex).replace(wildcardRegEx, '**/*') || '/**/*';
+    const patternPath = wildcardPath.substr(dirIndex);
+    const wildcardPattern = patternPath.replace(wildcardRegEx, (match, index) => {
+      return patternPath[index - 1] === path.sep ? '**/*' : '*/**/*';
+    }) || '/**/*';
     if (options.debugLog)
       console.log('Emitting directory ' + assetDirPath + wildcardPattern + ' for static use in module ' + id);
     const dirName = path.basename(assetDirPath);
@@ -372,11 +462,12 @@ module.exports = async function (content, map) {
           if (!assetState.assetSymlinks) {
             assetState.assetSymlinks = {}
           }
-          assetState.assetSymlinks[assetBase(options) + name + file.substr(assetDirPath.length)] = path.relative(baseDir, path.resolve(baseDir, symlink));
+          assetState.assetSymlinks[assetBase(options.outputAssetBase) + name + file.substr(assetDirPath.length)] = path.relative(baseDir, path.resolve(baseDir, symlink)).replace(/\\/g, '/');
         }
         else {
-          assetState.assetPermissions[assetBase(options) + name + file.substr(assetDirPath.length)] = stats.mode;
-          this.emitFile(assetBase(options) + name + file.substr(assetDirPath.length), source);
+          assetState.assetPermissions[assetBase(options.outputAssetBase) + name + file.substr(assetDirPath.length)] = stats.mode;
+          this.addDependency(file);
+          this.emitFile(assetBase(options.outputAssetBase) + name + file.substr(assetDirPath.length), source);
         }
       }));
     });
@@ -384,12 +475,12 @@ module.exports = async function (content, map) {
     let assetExpressions = '';
     let firstPrefix = '';
     if (wildcards) {
-      let curPattern = wildcardPattern;
+      let curPattern = patternPath;
       let first = true;
       for (const wildcard of wildcards) {
-        const nextWildcardIndex = curPattern.indexOf('**/*');
+        const nextWildcardIndex = curPattern.indexOf(WILDCARD);
         const wildcardPrefix = curPattern.substr(0, nextWildcardIndex);
-        curPattern = curPattern.substr(nextWildcardIndex + 4);
+        curPattern = curPattern.substr(nextWildcardIndex + 1);
         if (first) {
           firstPrefix = wildcardPrefix;
           first = false;
@@ -415,18 +506,18 @@ module.exports = async function (content, map) {
 
   let ast, isESM;
   try {
-    ast = acorn.parse(code, { allowReturnOutsideFunction: true });
+    ast = acorn.parse(code, { allowReturnOutsideFunction: true, ecmaVersion: 2020 });
     isESM = false;
   }
   catch (e) {}
   if (!ast) {
     try {
-      ast = acorn.parse(code, { sourceType: 'module' });
+      ast = acorn.parse(code, { sourceType: 'module', ecmaVersion: 2020 });
       isESM = true;
     }
     catch (e) {
-      this.callback(e);
-      return;
+      // Parser errors just skip analysis
+      return this.callback(null, code, map);
     }
   }
 
@@ -464,6 +555,8 @@ module.exports = async function (content, map) {
     };
     knownBindings.require.value.resolve[TRIGGER] = true;
   }
+
+  let wildcardBlocks = [];
 
   function setKnownBinding (name, value) {
     // require is somewhat special in that we shadow it but don't
@@ -604,9 +697,22 @@ module.exports = async function (content, map) {
         // we found the exact value for the require, and it used a binding from our analysis
         // -> inline the computed value for Webpack to use
         else if (typeof computed.value === 'string' && sawIdentifier) {
-          transformed = true;
-          magicString.overwrite(expression.start, expression.end, JSON.stringify(computed.value));
-          return this.skip();
+          if (computed.wildcards) {
+            const wildcardPath = path.resolve(dir, computed.value);
+            if (computed.wildcards.length === 1 && validAssetEmission(wildcardPath)) {
+              const emission = generateWildcardRequire(dir, wildcardPath, code.substring(computed.wildcards[0].start, computed.wildcards[0].end), wildcardBlocks, options.debugLog);
+              if (emission) {
+                magicString.overwrite(node.start, node.end, emission);
+                transformed = true;
+                return this.skip();
+              }
+            }
+          }
+          else if (computed.value) {
+            magicString.overwrite(expression.start, expression.end, JSON.stringify(computed.value));
+            transformed = true;
+            return this.skip();
+          }
         }
         // branched require, and it used a binding from our analysis
         // -> inline the computed values for Webpack
@@ -686,7 +792,7 @@ module.exports = async function (content, map) {
           if (other.type === 'Identifier' && other.name === 'module') {
             // inline the require.main check to be the target require.main check if this is the entry,
             // and false otherwise
-            if (id === entryId) {
+            if (entryIds && entryIds.indexOf(id) !== -1) {
               // require.main === module -> __non_webpack_require__.main == __non_webpack_require__.cache[eval('__filename')]
               // can be simplified if we get a way to get outer "module" in Webpack
               magicString.overwrite(other.start, other.end, "__non_webpack_require__.cache[eval('__filename')]");
@@ -702,6 +808,19 @@ module.exports = async function (content, map) {
           // leave require.ensure to webpack
           return this.skip();
         }
+      }
+      // module.require handling
+      else if (!isESM && node.type === 'MemberExpression' &&
+               node.object.type === 'Identifier' &&
+               node.object.name === 'module' &&
+               'module' in knownBindings === false &&
+               node.property.type === 'Identifier' &&
+               !node.computed &&
+               node.property.name === 'require') {
+        magicString.overwrite(node.start, node.end, 'require');
+        node.type = 'Identifier';
+        node.name = 'require';
+        transformed = true;
       }
       // Call expression cases and asset triggers
       // - fs triggers: fs.readFile(...)
@@ -741,7 +860,7 @@ module.exports = async function (content, map) {
             case BINDINGS:
               if (node.arguments.length) {
                 const arg = computePureStaticValue(node.arguments[0], false).result;
-                if (arg.value) {
+                if (arg && arg.value) {
                   let staticBindingsInstance = false;
                   let opts;
                   if (typeof arg.value === 'object')
@@ -767,6 +886,23 @@ module.exports = async function (content, map) {
                 }
               }
             break;
+            case NODE_GYP_BUILD:
+              if (node.arguments.length === 1 && node.arguments[0].type === 'Identifier' &&
+                  node.arguments[0].name === '__dirname' && knownBindings.__dirname.shadowDepth === 0) {
+                transformed = true;
+                let resolved;
+                try {
+                  resolved = nodeGypBuild.path(dir);
+                }
+                catch (e) {}
+                if (resolved) {
+                  staticChildValue = { value: resolved };
+                  staticChildNode = node;
+                  emitStaticChildAsset(path);
+                  return backtrack(this, parent);
+                }
+              }
+            break;
             // resolveFrom(__dirname, ...) -> require.resolve(...)
             case RESOLVE_FROM:
               if (node.arguments.length === 2 && node.arguments[0].type === 'Identifier' &&
@@ -780,7 +916,7 @@ module.exports = async function (content, map) {
             case NBIND_INIT:
               if (node.arguments.length) {
                 const arg = computePureStaticValue(node.arguments[0], false).result;
-                if (arg.value) {
+                if (arg && arg.value) {
                   const bindingInfo = nbind(arg.value);
                   if (bindingInfo) {
                     bindingInfo.path = path.relative(dir, bindingInfo.path);
@@ -823,7 +959,7 @@ module.exports = async function (content, map) {
           }
         }
       }
-      else if (node.type === 'VariableDeclaration') {
+      else if (node.type === 'VariableDeclaration' && !isVarLoop(parent)) {
         for (const decl of node.declarations) {
           if (!decl.init) continue;
           const computed = computePureStaticValue(decl.init, false).result;
@@ -845,7 +981,7 @@ module.exports = async function (content, map) {
                 setKnownBinding(prop.value.name, computed.value[prop.key.name]);
               }
             }
-            if (typeof computed.value === 'string' && computed.value.match(absoluteRegEx)) {
+            if (isAbsolutePathStr(computed.value)) {
               staticChildValue = computed;
               staticChildNode = decl.init;
               emitStaticChildAsset();
@@ -854,7 +990,7 @@ module.exports = async function (content, map) {
           }
         }
       }
-      else if (node.type === 'AssignmentExpression') {
+      else if (node.type === 'AssignmentExpression' && !isLoop(parent)) {
         const computed = computePureStaticValue(node.right, false).result;
         if (computed && 'value' in computed) {
           // var known = ...
@@ -874,7 +1010,7 @@ module.exports = async function (content, map) {
               setKnownBinding(prop.value.name, computed.value[prop.key.name]);
             }
           }
-          if (typeof computed.value === 'string' && computed.value.match(absoluteRegEx)) {
+          if (isAbsolutePathStr(computed.value)) {
             staticChildValue = computed;
             staticChildNode = node.right;
             emitStaticChildAsset();
@@ -915,11 +1051,11 @@ module.exports = async function (content, map) {
             parent.type === 'VariableDeclarator' &&
             parent.id.type === 'Identifier') {
           fnName = parent.id;
-          args = (node.arguments || node.params);
+          args = node.arguments || node.params;
         }
         else if (node.id) {
           fnName = node.id;
-          args = node.arguments;
+          args = node.arguments || node.params;
         }
         if (fnName && node.body.body) {
           let requireDecl, requireDeclaration, returned = false;
@@ -958,7 +1094,7 @@ module.exports = async function (content, map) {
             boundRequireName = fnName.name + '$$mod';
             setKnownBinding(fnName.name, BOUND_REQUIRE);
             const newFn = prefix + code.substring(node.start, fnName.start) + boundRequireName + code.substring(fnName.end, args[0].start + !wrapArgs) +
-                (wrapArgs ? '(' : '') + requireDecl.id.name + ', ' + code.substring(args[0].start, args[args.length - 1].end) + (wrapArgs ? ')' : '') + 
+                (wrapArgs ? '(' : '') + requireDecl.id.name + ', ' + code.substring(args[0].start, args[args.length - 1].end + !wrapArgs) + (wrapArgs ? ')' : '') + 
                 code.substring(args[0].end + !wrapArgs, requireDeclaration.start) + code.substring(requireDeclaration.end, node.end);
             magicString.appendRight(node.end, newFn);
           }
@@ -1000,6 +1136,8 @@ module.exports = async function (content, map) {
     return this.callback(null, code, map);
 
   assetEmissionPromises.then(() => {
+    if (wildcardBlocks.length)
+      magicString.appendLeft(ast.body[0].start, wildcardBlocks.join('\n') + '\n');
     code = magicString.toString();
     map = map || magicString.generateMap();
     if (map) {
@@ -1009,72 +1147,73 @@ module.exports = async function (content, map) {
     this.callback(null, code, map);
   });
 
-  function emitStaticChildAsset (wrapRequire = false) {
-    function validAssetEmission (assetPath) {
-      if (!assetPath)
-        return;
-      // do not emit own id
-      if (assetPath === id)
-        return;
-      let wildcardSuffix = '';
-      if (assetPath.endsWith(path.sep))
-        wildcardSuffix = path.sep;
-      else if (assetPath.endsWith(path.sep + WILDCARD))
-        wildcardSuffix = path.sep + WILDCARD;
-      else if (assetPath.endsWith(WILDCARD))
-        wildcardSuffix = WILDCARD;
-      // do not emit __dirname
-      if (assetPath === dir + wildcardSuffix)
-        return;
-      // do not emit cwd
-      if (assetPath === cwd + wildcardSuffix)
-        return;
-      // do not emit node_modules
-      if (assetPath.endsWith(path.sep + 'node_modules' + wildcardSuffix))
-        return;
-      // do not emit directories above __dirname
-      if (dir.startsWith(assetPath.substr(0, assetPath.length - wildcardSuffix.length) + path.sep))
-        return;
-      // do not emit asset directories higher than the node_modules base if a package
-      if (pkgBase) {
-        const nodeModulesBase = id.substr(0, id.lastIndexOf('node_modules')) + 'node_modules' + path.sep;
-        if (!assetPath.startsWith(nodeModulesBase)) {
-          if (options.debugLog) {
-            if (assetEmission(assetPath))
-              console.log('Skipping asset emission of ' + assetPath.replace(wildcardRegEx, '*') + ' for ' + id + ' as it is outside the package base ' + pkgBase);
-          }
-          return;
-        }
-      }
-      // otherwise, do not emit assets outside of the cwd
-      else if (!assetPath.startsWith(cwd)) {
+  function validAssetEmission (assetPath) {
+    if (!assetPath)
+      return;
+    // do not emit own id
+    if (assetPath === id)
+      return;
+    let wildcardSuffix = '';
+    if (assetPath.endsWith(path.sep))
+      wildcardSuffix = path.sep;
+    else if (assetPath.endsWith(path.sep + WILDCARD))
+      wildcardSuffix = path.sep + WILDCARD;
+    else if (assetPath.endsWith(WILDCARD))
+      wildcardSuffix = WILDCARD;
+    // do not emit __dirname
+    if (!options.emitDirnameAll && (assetPath === dir + wildcardSuffix))
+      return;
+    // do not emit cwd
+    if (!options.emitFilterAssetBaseAll && (assetPath === (options.filterAssetBase || cwd) + wildcardSuffix))
+      return;
+    // do not emit node_modules
+    if (assetPath.endsWith(path.sep + 'node_modules' + wildcardSuffix))
+      return;
+    // do not emit directories above __dirname
+    if (dir.startsWith(assetPath.substr(0, assetPath.length - wildcardSuffix.length) + path.sep))
+      return;
+    // do not emit asset directories higher than the node_modules base if a package
+    if (pkgBase) {
+      const nodeModulesBase = id.substr(0, id.indexOf(path.sep + 'node_modules')) + path.sep + 'node_modules' + path.sep;
+      if (!assetPath.startsWith(nodeModulesBase)) {
         if (options.debugLog) {
           if (assetEmission(assetPath))
-            console.log('Skipping asset emission of ' + assetPath.replace(wildcardRegEx, '*') + ' for ' + id + ' as it is outside the process directory ' + cwd);
+            console.log('Skipping asset emission of ' + assetPath.replace(wildcardRegEx, '*') + ' for ' + id + ' as it is outside the package base ' + pkgBase);
         }
         return;
       }
-      return assetEmission(assetPath);
     }
-    function assetEmission (assetPath) {
-      // verify the asset file / directory exists
-      const wildcardIndex = assetPath.indexOf(WILDCARD);
-      const dirIndex = wildcardIndex === -1 ? assetPath.length : assetPath.lastIndexOf(path.sep, assetPath.substr(0, wildcardIndex));
-      const basePath = assetPath.substr(0, dirIndex);
-      try {
-        const stats = statSync(basePath);
-        if (wildcardIndex !== -1 && stats.isFile())
-          return;
-        if (stats.isFile())
-          return emitAsset;
-        if (stats.isDirectory())
-          return emitAssetDirectory;
+    // otherwise, do not emit assets outside of the filterAssetBase
+    else if (!assetPath.startsWith(options.filterAssetBase || cwd)) {
+      if (options.debugLog) {
+        if (assetEmission(assetPath))
+          console.log('Skipping asset emission of ' + assetPath.replace(wildcardRegEx, '*') + ' for ' + id + ' as it is outside the filterAssetBase directory ' + (options.filterAssetBase || cwd));
       }
-      catch (e) {
+      return;
+    }
+    return assetEmission(assetPath);
+  }
+  function assetEmission (assetPath) {
+    // verify the asset file / directory exists
+    const wildcardIndex = assetPath.indexOf(WILDCARD);
+    const dirIndex = wildcardIndex === -1 ? assetPath.length : assetPath.lastIndexOf(path.sep, wildcardIndex);
+    const basePath = assetPath.substr(0, dirIndex);
+    try {
+      const stats = statSync(basePath);
+      if (wildcardIndex !== -1 && stats.isFile())
         return;
-      }
+      if (stats.isFile())
+        return emitAsset;
+      if (stats.isDirectory())
+        return emitAssetDirectory;
     }
-    if ('value' in staticChildValue) {
+    catch (e) {
+      return;
+    }
+  }
+
+  function emitStaticChildAsset (wrapRequire = false) {
+    if (isAbsolutePathStr(staticChildValue.value)) {
       let resolved;
       try { resolved = path.resolve(staticChildValue.value); }
       catch (e) {}
@@ -1091,7 +1230,7 @@ module.exports = async function (content, map) {
         }
       }
     }
-    else {
+    else if (isAbsolutePathStr(staticChildValue.then) && isAbsolutePathStr(staticChildValue.else)) {
       let resolvedThen;
       try { resolvedThen = path.resolve(staticChildValue.then); }
       catch (e) {}
@@ -1126,12 +1265,13 @@ module.exports.getSymlinks = function() {
     return lastState.assetSymlinks;
 };
 
-module.exports.initAssetPermissionsCache = function (compilation) {
-  const entryId = getEntryId(compilation);
-  if (!entryId)
+module.exports.initAssetCache = module.exports.initAssetPermissionsCache = function (compilation, outputAssetBase) {
+  injectPathHook(compilation, outputAssetBase);
+  const entryIds = getEntryIds(compilation);
+  if (!entryIds)
     return;
   const state = lastState = {
-    entryId: entryId,
+    entryIds: entryIds,
     assets: Object.create(null),
     assetNames: Object.create(null),
     assetPermissions: Object.create(null),
@@ -1139,7 +1279,7 @@ module.exports.initAssetPermissionsCache = function (compilation) {
     hadOptions: false
   };
   stateMap.set(compilation, state);
-  compilation.cache.get('/RelocateLoader/AssetState/' + entryId, null, (err, _assetState) => {
+  compilation.cache.get('/RelocateLoader/AssetState/' + JSON.stringify(entryIds), null, (err, _assetState) => {
     if (err) console.error(err);
     if (_assetState) {
       const parsedState = JSON.parse(_assetState);
@@ -1150,7 +1290,7 @@ module.exports.initAssetPermissionsCache = function (compilation) {
     }
   });
   compilation.compiler.hooks.afterCompile.tap("relocate-loader", compilation => {
-    compilation.cache.store('/RelocateLoader/AssetState/' + entryId, null, JSON.stringify({
+    compilation.cache.store('/RelocateLoader/AssetState/' + JSON.stringify(entryIds), null, JSON.stringify({
       assetPermissions: state.assetPermissions,
       assetSymlinks: state.assetSymlinks
     }), (err) => {

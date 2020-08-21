@@ -79,6 +79,7 @@ module.exports =
 /******/
 /******/ 	// __webpack_public_path__
 /******/ 	__webpack_require__.p = "";
+/******/ 	__webpack_require__.ab = __dirname + "/";
 /******/
 /******/
 /******/ 	// Load entry module and return exports
@@ -90,7 +91,7 @@ module.exports =
 /***/ (function(module, exports, __webpack_require__) {
 
 "use strict";
-/* WEBPACK VAR INJECTION */(function(__dirname) {
+
 /*
  * Sets/gets whether client code is being served.
  *
@@ -103,16 +104,16 @@ Server.prototype.serveClient = function(v){
   if (!arguments.length) return this._serveClient;
   this._serveClient = v;
   var resolvePath = function(file){
-    var filepath = path.resolve(__dirname, './../../', file);
+    var filepath = path.resolve(__webpack_require__.ab + "socket.io", './../../', file);
     if (exists(filepath)) {
       return filepath;
     }
     return require.resolve(file);
   };
   if (v && !clientSource) {
-    clientSource = read(__dirname + '/socket.io.js', 'utf-8');
+    clientSource = read(resolvePath( 'socket.io-client/dist/socket.io.js'), 'utf-8');
     try {
-      clientSourceMap = read(__dirname + '/socket.io.js.map', 'utf-8');
+      clientSourceMap = read(resolvePath( 'socket.io-client/dist/socket.io.js.map'), 'utf-8');
     } catch(err) {
       debug('could not load sourcemap file');
     }
@@ -120,7 +121,6 @@ Server.prototype.serveClient = function(v){
   return this;
 };
 
-/* WEBPACK VAR INJECTION */}.call(this, "/"))
 
 /***/ })
 /******/ ]);

@@ -1,5 +1,6 @@
 const path = require('path');
 const resolve = require('resolve');
+const fs = require('fs');
 const handleWrappers = require('./wrappers.js');
 
 module.exports = function ({ id, code, pkgBase, ast, scope, magicString, emitAssetDirectory }) {
@@ -17,9 +18,11 @@ module.exports = function ({ id, code, pkgBase, ast, scope, magicString, emitAss
           statement.declarations[0].id.type === 'Identifier' &&
           statement.declarations[0].id.name === 'googleProtoFilesDir') {
         const emission = emitAssetDirectory(path.resolve(path.dirname(id), global._unit ? './' : '../../../google-proto-files'));
-        magicString.overwrite(statement.declarations[0].init.start, statement.declarations[0].init.end, emission);
-        statement.declarations[0].init = null;
-        return { transformed: true };
+        if (emission) {
+          magicString.overwrite(statement.declarations[0].init.start, statement.declarations[0].init.end, emission);
+          statement.declarations[0].init = null;
+          return { transformed: true };
+        }
       }
     }
   }
@@ -117,7 +120,9 @@ module.exports = function ({ id, code, pkgBase, ast, scope, magicString, emitAss
           statement.body.body[0].block.body[0].expression.right.arguments[0].property.name === 'i') {
         const arg = statement.body.body[0].block.body[0].expression.right.arguments[0];
         statement.body.body[0].block.body[0].expression.right.arguments = [{ type: 'Literal', value: '_' }];
-        const binaryName = 'oracledb-abi' + process.versions.modules + '-' + process.platform + '-' + process.arch + '.node';
+        const version = global._unit ? '3.0.0' : JSON.parse(fs.readFileSync(id.slice(0, -15) + 'package.json')).version;
+        const useVersion = Number(version.slice(0, version.indexOf('.'))) >= 4;
+        const binaryName = 'oracledb-' + (useVersion ? version : 'abi' + process.versions.modules) + '-' + process.platform + '-' + process.arch + '.node';
         magicString.overwrite(arg.start, arg.end, global._unit ? "'./oracledb.js'" : "'../build/Release/" + binaryName + "'");
         return { transformed: true };
       }
