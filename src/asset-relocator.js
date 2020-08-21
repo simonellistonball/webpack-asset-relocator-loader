@@ -118,7 +118,7 @@ function getEntryIds (compilation) {
             if (entry && Array.isArray(entry.import)) {
               return entry.import;
             }
-            
+
             return [];
           })
         ).map(entryString => resolve.sync(entryString, { extensions }));
@@ -247,8 +247,6 @@ staticPath.resolve = staticPath.default.resolve = function (...args) {
 };
 staticPath.resolve[TRIGGER] = true;
 
-const absoluteRegEx = /^\/[^\/]+|^[a-z]:[\\/][^\\/]+/i;
-
 const excludeAssetExtensions = new Set(['.h', '.cmake', '.c', '.cpp']);
 const excludeAssetFiles = new Set(['CHANGELOG.md', 'README.md', 'readme.md', 'changelog.md']);
 let cwd;
@@ -341,8 +339,8 @@ module.exports = async function (content, map) {
     await sharedlibEmit(pkgBase, assetState, assetBase(options.outputAssetBase), this.emitFile);
 
     const name = getUniqueAssetName(id.substr(pkgBase.length + 1), id, assetState.assetNames);
-    
-    const permissions = await new Promise((resolve, reject) => 
+
+    const permissions = await new Promise((resolve, reject) =>
       stat(id, (err, stats) => err ? reject(err) : resolve(stats.mode))
     );
     assetState.assetPermissions[name] = permissions;
@@ -356,7 +354,7 @@ module.exports = async function (content, map) {
     return this.callback(null, code, map);
 
   let code = content.toString();
-  
+
   if (typeof options.production === 'boolean' && staticProcess.env.NODE_ENV === UNKNOWN) {
     staticProcess.env.NODE_ENV = options.production ? 'production' : 'dev';
   }
@@ -401,7 +399,7 @@ module.exports = async function (content, map) {
         new Promise((resolve, reject) =>
           readFile(assetPath, (err, source) => err ? reject(err) : resolve(source))
         ),
-        await new Promise((resolve, reject) => 
+        await new Promise((resolve, reject) =>
           lstat(assetPath, (err, stats) => err ? reject(err) : resolve(stats))
         )
       ]);
@@ -435,7 +433,7 @@ module.exports = async function (content, map) {
     assetState.assets[assetDirPath] = name;
 
     // this used to be async but had to switch to support no emission for no detection
-    const files = glob.sync(assetDirPath + wildcardPattern, { mark: true, ignore: 'node_modules/**/*' }).filter(name => 
+    const files = glob.sync(assetDirPath + wildcardPattern, { mark: true, ignore: 'node_modules/**/*' }).filter(name =>
       !excludeAssetExtensions.has(path.extname(name)) &&
       !excludeAssetFiles.has(path.basename(name)) &&
       !name.endsWith(path.sep)
@@ -450,7 +448,7 @@ module.exports = async function (content, map) {
           new Promise((resolve, reject) =>
             readFile(file, (err, source) => err ? reject(err) : resolve(source))
           ),
-          await new Promise((resolve, reject) => 
+          await new Promise((resolve, reject) =>
             lstat(file, (err, stats) => err ? reject(err) : resolve(stats))
           )
         ]);
@@ -834,7 +832,7 @@ module.exports = async function (content, map) {
         // and that function has a [TRIGGER] symbol -> trigger asset emission from it
         if (calleeValue && typeof calleeValue.value === 'function' && calleeValue.value[TRIGGER]) {
           staticChildValue = computePureStaticValue(node, true).result;
-          // if it computes, then we start backtrackingelse 
+          // if it computes, then we start backtrackingelse
           if (staticChildValue) {
             staticChildNode = node;
             return backtrack(this, parent);
@@ -1094,7 +1092,7 @@ module.exports = async function (content, map) {
             boundRequireName = fnName.name + '$$mod';
             setKnownBinding(fnName.name, BOUND_REQUIRE);
             const newFn = prefix + code.substring(node.start, fnName.start) + boundRequireName + code.substring(fnName.end, args[0].start + !wrapArgs) +
-                (wrapArgs ? '(' : '') + requireDecl.id.name + ', ' + code.substring(args[0].start, args[args.length - 1].end + !wrapArgs) + (wrapArgs ? ')' : '') + 
+                (wrapArgs ? '(' : '') + requireDecl.id.name + ', ' + code.substring(args[0].start, args[args.length - 1].end + !wrapArgs) + (wrapArgs ? ')' : '') +
                 code.substring(args[0].end + !wrapArgs, requireDeclaration.start) + code.substring(requireDeclaration.end, node.end);
             magicString.appendRight(node.end, newFn);
           }
